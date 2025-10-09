@@ -62,7 +62,7 @@ class NeuroInspiredModalityOrdering(nn.Module):
         self.temperature_scheduler = 0.99  # 训练过程中逐渐降低温度
         
         # =============== 6. 历史记忆单元 (记忆网络启发) ===============
-        self.ordering_memory = nn.GRUCell(num_modalities, hidden_dim)
+        self.ordering_memory = nn.GRUCell(input_size=num_modalities,hidden_size=hidden_dim)
         self.memory_hidden = None
 
         # =============== 7. 可解释性：排序评分存储 ===============
@@ -238,21 +238,36 @@ class NeuroInspiredModalityOrdering(nn.Module):
 
     def update_memory(self, ordering_indices: torch.Tensor):
         """
-        更新神经记忆，记住过去选择的排序
-        使用GRU Cell实现
-        """
+    更新神经记忆，记住过去选择的排序
+    使用GRU Cell实现
+    
+    Args:
+        ordering_indices: shape [batch_size]，每个样本选择的排列索引
+    Returns:
+        memory_hidden: shape [batch_size, hidden_dim]
+         """
         batch_size = ordering_indices.shape[0]
-        
-        if self.memory_hidden is None:
-            self.memory_hidden = torch.zeros(
-                batch_size, self.hidden_dim, device=ordering_indices.device
-            )
+        device = ordering_indices.device
+    
+    # 初始化或重置隐藏状态（如果batch_size变化）
+        if self.memory_hidden is None or self.memory_hidden.shape[0] != batch_size:
+            self.memory_hidden = torch.zeros(batch_size, self.hidden_dim, device=device)
 
-        # 将排列索引归一化到 [0, 1]
-        normalized_indices = ordering_indices.float() / len(self.permutations)
-        
-        # 更新记忆
-        self.memory_hidden = self.ordering_memory(normalized_indices, self.memory_hidden)
+    # 将排列索引归一化到 [0, 1]
+    # ordering_indices shape: [batch_size]
+        normalized_idx = ordering_indices.float() / len(self.permutations)
+    
+    # 扩展为 [batch_size, num_modalities] 的输入
+    # GRUCell 需要输入 shape: [batch_size, input_size]
+        memory_input = normalized_idx.unsqueeze(1).repeat(1, self.num_modalities)
+    
+    # 确保维度正确
+        assert memory_input.shape == (batch_size, self.num_modalities), \
+        f"Expected memory_input shape ({batch_size}, {self.num_modalities}), got {memory_input.shape}"
+    
+    # 更新记忆状态
+        self.memory_hidden = self.ordering_memory(memory_input, self.memory_hidden)
+
 
         return self.memory_hidden
 
