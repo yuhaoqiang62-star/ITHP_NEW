@@ -38,24 +38,12 @@ class ITHP_DebertaModel(DebertaV2PreTrainedModel):
 
         self.init_weights()
 
-    def forward(self, input_ids, visual, acoustic, attention_mask=None, epoch=0, max_epochs=100):
-        """
-        前向传播
-        
-        参数:
-            input_ids: 文本input ids
-            visual: 视觉特征
-            acoustic: 声学特征
-            attention_mask: 注意力mask (可选)
-            epoch: 当前训练轮次 (用于temperature衰减)
-            max_epochs: 最大训练轮次
-        """
-        embedding_output = self.model(input_ids, attention_mask=attention_mask)
-        x = embedding_output[0]  # token-level 表征 [batch_size, seq_len, hidden_size]
+    def forward(self, input_ids, visual, acoustic,attention_mask=None):
+        embedding_output = self.model(input_ids,attention_mask=attention_mask )
+        x = embedding_output[0]  # token-level 表征
 
-        # 调用ITHP模型，传入epoch和max_epochs用于神经启发的模态排序
-        b1, IB_total, kl_loss_0, mse_0, kl_loss_1, mse_1, intermediate = self.ITHP(
-            x, visual, acoustic, epoch=epoch, max_epochs=max_epochs
+        b1, IB_total, kl_loss_0, mse_0, kl_loss_1, mse_1, _ = self.ITHP(
+            x, visual, acoustic
         )
 
         h_m = self.expand(b1)
@@ -64,6 +52,7 @@ class ITHP_DebertaModel(DebertaV2PreTrainedModel):
         sequence_output = self.dropout(self.LayerNorm(acoustic_vis_embedding + x))
         pooled_output = self.pooler(sequence_output)
 
+        # 🚨 返回 6 个值
         return pooled_output, IB_total, kl_loss_0, mse_0, kl_loss_1, mse_1
 
 
@@ -77,23 +66,13 @@ class ITHP_DeBertaForSequenceClassification(DebertaV2PreTrainedModel):
 
         self.init_weights()
 
-    def forward(self, input_ids, visual, acoustic, attention_mask=None, epoch=0, max_epochs=100):
-        """
-        前向传播
-        
-        参数:
-            input_ids: 文本input ids
-            visual: 视觉特征
-            acoustic: 声学特征
-            attention_mask: 注意力mask (可选)
-            epoch: 当前训练轮次
-            max_epochs: 最大训练轮次
-        """
+    def forward(self, input_ids, visual, acoustic,attention_mask=None):
         pooled_output, IB_total, kl_loss_0, mse_0, kl_loss_1, mse_1 = self.dberta(
-            input_ids, visual, acoustic, attention_mask=attention_mask, epoch=epoch, max_epochs=max_epochs
+            input_ids, visual, acoustic,attention_mask=attention_mask
         )
 
         pooled_output = self.dropout(pooled_output)
         logits = self.classifier(pooled_output)
 
+        # 🚨 返回 6 个值
         return logits, IB_total, kl_loss_0, mse_0, kl_loss_1, mse_1
