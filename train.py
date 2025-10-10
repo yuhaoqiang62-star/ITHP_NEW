@@ -3,7 +3,7 @@ import os
 import random
 import pickle
 import numpy as np
-from datetime import datetime
+from datetime import datetime  # 导入datetime模块
 
 from sklearn.metrics import accuracy_score, f1_score
 
@@ -40,192 +40,47 @@ def log_results(file_path, message):
         f.flush()
 
 
-# ============ 修改：添加 epoch 和 max_epochs 参数 ============
-def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, scheduler, 
-                epoch: int = 0, max_epochs: int = 100):
-    """
-    训练一个epoch
-    
-    参数:
-        model: 模型
-        train_dataloader: 训练数据加载器
-        optimizer: 优化器
-        scheduler: 学习率调度器
-        epoch: 当前轮次 (从0开始计数)
-        max_epochs: 最大轮次
-    """
-    model.train()
-    tr_loss = 0
-    nb_tr_examples, nb_tr_steps = 0, 0
-    
-    for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
-        batch = tuple(t.to(DEVICE) for t in batch)
-        input_ids, visual, acoustic, attention_mask, label_ids = batch
-        visual = torch.squeeze(visual, 1)
-        acoustic = torch.squeeze(acoustic, 1)
+def train(
+        model,
+        train_dataloader,
+        validation_dataloader,
+        test_data_loader,
+        optimizer,
+        scheduler,
+):
+    valid_losses = []
+    test_accuracies = []
+    mae_list = []
+    corr_list = []
+    f1_list = []
 
-        visual_norm = (visual - visual.min()) / (visual.max() - visual.min() + 1e-8)
-        acoustic_norm = (acoustic - acoustic.min()) / (acoustic.max() - acoustic.min() + 1e-8)
-        
-        # ✅ 修改：传入 epoch 和 max_epochs
-        logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1 = model(
-            input_ids,
-            visual_norm,
-            acoustic_norm,
-            attention_mask=attention_mask,
-            epoch=epoch,  # ✅ 添加这行
-            max_epochs=max_epochs  # ✅ 添加这行
-        )
-        
-        loss_fct = MSELoss()
-        loss = loss_fct(logits.view(-1), label_ids.view(-1)) + 2 / (args.p_beta + args.p_gamma) * IB_loss
+    # 使用时间戳生成一个唯一的文件名
+    result_file = get_result_filename()
 
-        if args.gradient_accumulation_step > 1:
-            loss = loss / args.gradient_accumulation_step
+    for epoch_i in range(int(args.n_epochs)):
+        train_loss = train_epoch(model, train_dataloader, optimizer, scheduler)
+        valid_loss = eval_epoch(model, validation_dataloader)
 
-        loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-        tr_loss += loss.item()
-        nb_tr_steps += 1
-
-        if (step + 1) % args.gradient_accumulation_step == 0:
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-
-    return tr_loss / nb_tr_steps
-
-
-# ============ 修改：添加 epoch 和 max_epochs 参数 ============
-def eval_epoch(model: nn.Module, dev_dataloader: DataLoader, 
-               epoch: int = 0, max_epochs: int = 100):
-    """
-    验证阶段
-    
-    参数:
-        model: 模型
-        dev_dataloader: 验证数据加载器
-        epoch: 当前轮次
-        max_epochs: 最大轮次
-    """
-    model.eval()
-    dev_loss = 0
-    nb_dev_examples, nb_dev_steps = 0, 0
-    with torch.no_grad():
-        for step, batch in enumerate(tqdm(dev_dataloader, desc="Iteration")):
-            batch = tuple(t.to(DEVICE) for t in batch)
-            input_ids, visual, acoustic, attention_mask, label_ids = batch
-            visual = torch.squeeze(visual, 1)
-            acoustic = torch.squeeze(acoustic, 1)
-
-            visual_norm = (visual - visual.min()) / (visual.max() - visual.min() + 1e-8)
-            acoustic_norm = (acoustic - acoustic.min()) / (acoustic.max() - acoustic.min() + 1e-8)
-
-            # ✅ 修改：传入 epoch 和 max_epochs
-            logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1 = model(
-                input_ids,
-                visual_norm,
-                acoustic_norm,
-                attention_mask=attention_mask,
-                epoch=epoch,  # ✅ 添加这行
-                max_epochs=max_epochs  # ✅ 添加这行
+        if epoch_i != args.n_epochs - 1:
+            # 训练阶段输出
+            train_message = f"TRAIN: epoch:{epoch_i + 1}, train_loss:{train_loss}, valid_loss:{valid_loss}"
+            print(train_message)
+            log_results(result_file, train_message)  # 追加到文件
+        else:
+            # 测试阶段输出
+            test_acc, test_mae, test_corr, test_f_score = test_score_model(
+                model, test_data_loader
             )
-            
-            loss_fct = MSELoss()
-            loss = loss_fct(logits.view(-1), label_ids.view(-1))
-
-            if args.gradient_accumulation_step > 1:
-                loss = loss / args.gradient_accumulation_step
-
-            dev_loss += loss.item()
-            nb_dev_steps += 1
-
-    return dev_loss / nb_dev_steps
-
-
-# ============ 修改：添加 epoch 和 max_epochs 参数 ============
-def test_epoch(model: nn.Module, test_dataloader: DataLoader, 
-               epoch: int = 0, max_epochs: int = 100):
-    """
-    测试阶段
-    
-    参数:
-        model: 模型
-        test_dataloader: 测试数据加载器
-        epoch: 当前轮次
-        max_epochs: 最大轮次
-    """
-    model.eval()
-    preds = []
-    labels = []
-
-    with torch.no_grad():
-        for batch in tqdm(test_dataloader):
-            batch = tuple(t.to(DEVICE) for t in batch)
-
-            input_ids, visual, acoustic, attention_mask, label_ids = batch
-            visual = torch.squeeze(visual, 1)
-            acoustic = torch.squeeze(acoustic, 1)
-
-            visual_norm = (visual - visual.min()) / (visual.max() - visual.min() + 1e-8)
-            acoustic_norm = (acoustic - acoustic.min()) / (acoustic.max() - acoustic.min() + 1e-8)
-
-            # ✅ 修改：传入 epoch 和 max_epochs
-            logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1 = model(
-                input_ids,
-                visual_norm,
-                acoustic_norm,
-                attention_mask=attention_mask,
-                epoch=epoch,  # ✅ 添加这行
-                max_epochs=max_epochs  # ✅ 添加这行
+            test_message = (
+                f"TEST: train_loss:{train_loss}, valid_loss:{valid_loss}, "
+                f"test_acc:{test_acc}, mae:{test_mae}, corr:{test_corr}, f1_score:{test_f_score}"
             )
+            print(test_message)
+            log_results(result_file, test_message)  # 追加到文件
 
-            logits = logits.detach().cpu().numpy()
-            label_ids = label_ids.detach().cpu().numpy()
-
-            logits = np.squeeze(logits).tolist()
-            label_ids = np.squeeze(label_ids).tolist()
-
-            preds.extend(logits)
-            labels.extend(label_ids)
-
-        preds = np.array(preds)
-        labels = np.array(labels)
-
-    return preds, labels
+    return train_loss, valid_loss, test_acc, test_mae, test_corr, test_f_score
 
 
-def test_score_model(model: nn.Module, test_dataloader: DataLoader, 
-                     epoch: int = 0, max_epochs: int = 100, use_zero=False):
-    """
-    计算测试集的各项指标
-    
-    参数:
-        model: 模型
-        test_dataloader: 测试数据加载器
-        epoch: 当前轮次
-        max_epochs: 最大轮次
-        use_zero: 是否包括零标签
-    """
-    preds, y_test = test_epoch(model, test_dataloader, epoch, max_epochs)
-    non_zeros = np.array(
-        [i for i, e in enumerate(y_test) if e != 0 or use_zero])
-
-    preds = preds[non_zeros]
-    y_test = y_test[non_zeros]
-
-    mae = np.mean(np.absolute(preds - y_test))
-    corr = np.corrcoef(preds, y_test)[0][1]
-
-    preds = preds >= 0
-    y_test = y_test >= 0
-
-    f_score = f1_score(y_test, preds, average="weighted")
-    acc = accuracy_score(y_test, preds)
-
-    return acc, mae, corr, f_score
 
 
 parser = argparse.ArgumentParser()
@@ -244,14 +99,17 @@ parser.add_argument("--warmup_proportion", type=float, default=0.1)
 parser.add_argument("--seed", type=int, default=128)
 parser.add_argument('--inter_dim', default=256, help='dimension of inter layers', type=int)
 parser.add_argument("--drop_prob", help='drop probability for dropout -- encoder', default=0.3,
-                    type=float)
-parser.add_argument('--p_lambda', default=0.3, help='coefficient -- lambda', type=float)
-parser.add_argument('--p_beta', default=8, help='coefficient -- beta', type=float)
+                    type=float)  # Dropout for ITHP
+parser.add_argument('--p_lambda', default=0.3, help='coefficient -- lambda', type=float)  # For IB2
+parser.add_argument('--p_beta', default=8, help='coefficient -- beta', type=float)  # For IB1
 parser.add_argument('--p_gamma', default=32, help='coefficient -- gamma', type=float)
 parser.add_argument('--beta_shift', default=1.0, help='coefficient -- shift', type=float)
 parser.add_argument('--IB_coef', default=10, type=float)
 parser.add_argument('--B0_dim', default=128, type=float)
 parser.add_argument('--B1_dim', default=64, type=float)
+#parser.add_argument('--B2_dim', default=32, type=float, help='dimension for B2 layer')
+
+# 新增参数：结果保存相关
 parser.add_argument("--results_dir", type=str, default="results",
                     help="Directory to save results")
 parser.add_argument("--save_model", action="store_true", default=False,
@@ -380,7 +238,7 @@ def get_appropriate_dataset(data):
     all_input_ids = torch.tensor(np.array([f.input_ids for f in features]), dtype=torch.long)
     all_visual = torch.tensor(np.array([f.visual for f in features]), dtype=torch.float)
     all_acoustic = torch.tensor(np.array([f.acoustic for f in features]), dtype=torch.float)
-    all_input_mask = torch.tensor(np.array([f.input_mask for f in features]), dtype=torch.long)
+    all_input_mask = torch.tensor(np.array([f.input_mask for f in features]), dtype=torch.long)  # ✅ 添加
     all_label_ids = torch.tensor(np.array([f.label_id for f in features]), dtype=torch.float)
 
     dataset = TensorDataset(
@@ -488,7 +346,183 @@ def prep_for_training(num_train_optimization_steps: int):
     return model, optimizer, scheduler
 
 
-# ============ 修改：添加 epoch 和 max_epochs 参数传递 ============
+def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, scheduler):
+    model.train()
+    tr_loss = 0
+    nb_tr_examples, nb_tr_steps = 0, 0
+
+    # ✅ 用于收集模态权重统计
+    modality_weights_stats = {
+        'text': [],
+        'acoustic': [],
+        'visual': []
+    }
+
+    for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
+        batch = tuple(t.to(DEVICE) for t in batch)
+        input_ids, visual, acoustic,attention_mask, label_ids = batch
+        visual = torch.squeeze(visual, 1)
+        acoustic = torch.squeeze(acoustic, 1)
+
+        visual_norm = (visual - visual.min()) / (visual.max() - visual.min())
+        acoustic_norm = (acoustic - acoustic.min()) / (acoustic.max() - acoustic.min())
+        logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1 = model(
+            input_ids,
+            visual_norm,
+            acoustic_norm,
+            attention_mask=attention_mask  # ✅ 传入mask
+        )
+
+        # ✅ 获取模态权重（如果模型返回了中间结果）
+        if hasattr(model, 'module'):  # 处理DataParallel情况
+            ithp_model = model.module.dberta.ITHP
+        else:
+            ithp_model = model.dberta.ITHP
+            
+        if hasattr(ithp_model, 'modality_weights_history') and len(ithp_model.modality_weights_history) > 0:
+            last_weights = ithp_model.modality_weights_history[-1]
+            modality_weights_stats['text'].append(last_weights['text'])
+            modality_weights_stats['acoustic'].append(last_weights['acoustic'])
+            modality_weights_stats['visual'].append(last_weights['visual'])
+
+
+        loss_fct = MSELoss()
+        loss = loss_fct(logits.view(-1), label_ids.view(-1)) + 2 / (args.p_beta + args.p_gamma) * IB_loss
+
+        if args.gradient_accumulation_step > 1:
+            loss = loss / args.gradient_accumulation_step
+
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        tr_loss += loss.item()
+        nb_tr_steps += 1
+
+        if (step + 1) % args.gradient_accumulation_step == 0:
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+
+    # ✅ 打印模态权重统计
+    if modality_weights_stats['text']:
+        print(f"\\n模态权重统计:")
+        print(f"  文本模态平均权重: {np.mean(modality_weights_stats['text']):.4f}")
+        print(f"  声学模态平均权重: {np.mean(modality_weights_stats['acoustic']):.4f}")
+        print(f"  视觉模态平均权重: {np.mean(modality_weights_stats['visual']):.4f}")
+
+    return tr_loss / nb_tr_steps
+
+
+def eval_epoch(model: nn.Module, dev_dataloader: DataLoader):
+    model.eval()
+    dev_loss = 0
+    nb_dev_examples, nb_dev_steps = 0, 0
+    with torch.no_grad():
+        for step, batch in enumerate(tqdm(dev_dataloader, desc="Iteration")):
+            batch = tuple(t.to(DEVICE) for t in batch)
+            input_ids, visual, acoustic, attention_mask,label_ids = batch
+            visual = torch.squeeze(visual, 1)
+            acoustic = torch.squeeze(acoustic, 1)
+
+            visual_norm = (visual - visual.min()) / (visual.max() - visual.min())
+            acoustic_norm = (acoustic - acoustic.min()) / (acoustic.max() - acoustic.min())
+
+            logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1 = model(
+                input_ids,
+                visual_norm,
+                acoustic_norm,
+                attention_mask=attention_mask  # ✅ 传入mask
+            )
+            loss_fct = MSELoss()
+            loss = loss_fct(logits.view(-1), label_ids.view(-1))
+
+            if args.gradient_accumulation_step > 1:
+                loss = loss / args.gradient_accumulation_step
+
+            dev_loss += loss.item()
+            nb_dev_steps += 1
+
+    return dev_loss / nb_dev_steps
+
+
+def test_epoch(model: nn.Module, test_dataloader: DataLoader):
+    model.eval()
+    preds = []
+    labels = []
+
+    with torch.no_grad():
+        for batch in tqdm(test_dataloader):
+            batch = tuple(t.to(DEVICE) for t in batch)
+
+            input_ids, visual, acoustic, attention_mask,label_ids = batch
+            visual = torch.squeeze(visual, 1)
+            acoustic = torch.squeeze(acoustic, 1)
+
+            visual_norm = (visual - visual.min()) / (visual.max() - visual.min())
+            acoustic_norm = (acoustic - acoustic.min()) / (acoustic.max() - acoustic.min())
+
+            logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1 = model(
+                input_ids,
+                visual_norm,
+                acoustic_norm,
+                attention_mask=attention_mask  # ✅ 传入mask
+            )
+
+            logits = logits.detach().cpu().numpy()
+            label_ids = label_ids.detach().cpu().numpy()
+
+            logits = np.squeeze(logits).tolist()
+            label_ids = np.squeeze(label_ids).tolist()
+
+            preds.extend(logits)
+            labels.extend(label_ids)
+
+        preds = np.array(preds)
+        labels = np.array(labels)
+
+    return preds, labels
+
+
+def test_score_model(model: nn.Module, test_dataloader: DataLoader, use_zero=False):
+    preds, y_test = test_epoch(model, test_dataloader)
+    non_zeros = np.array(
+        [i for i, e in enumerate(y_test) if e != 0 or use_zero])
+
+    preds = preds[non_zeros]
+    y_test = y_test[non_zeros]
+
+    mae = np.mean(np.absolute(preds - y_test))
+    corr = np.corrcoef(preds, y_test)[0][1]
+
+    preds = preds >= 0
+    y_test = y_test >= 0
+
+    f_score = f1_score(y_test, preds, average="weighted")
+    acc = accuracy_score(y_test, preds)
+
+    return acc, mae, corr, f_score
+
+
+# 获取当前时间的时间戳
+def get_timestamp():
+    return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+
+# 动态生成结果文件名，使用时间戳
+def get_result_filename():
+    timestamp = get_timestamp()
+    return f"result_{timestamp}.txt"
+
+
+def log_results(file_path, message):
+    """将训练和测试的结果写入result文件（不清空，追加模式）"""
+    with open(file_path, 'a') as f:  # 使用 'a' 模式以追加内容
+        f.write(message + '\n')
+        f.flush()
+
+
 def train(
         model,
         train_dataloader,
@@ -497,9 +531,6 @@ def train(
         optimizer,
         scheduler,
 ):
-    """
-    完整的训练循环
-    """
     valid_losses = []
     test_accuracies = []
     mae_list = []
@@ -509,50 +540,32 @@ def train(
     # 使用时间戳生成一个唯一的文件名
     result_file = get_result_filename()
 
-    # ✅ 获取最大轮次
-    max_epochs = int(args.n_epochs)
+    for epoch_i in range(int(args.n_epochs)):
+        train_loss = train_epoch(model, train_dataloader, optimizer, scheduler)
+        valid_loss = eval_epoch(model, validation_dataloader)
 
-    for epoch_i in range(max_epochs):
-        # ✅ 修改：传入 epoch_i 和 max_epochs
-        train_loss = train_epoch(
-            model, 
-            train_dataloader, 
-            optimizer, 
-            scheduler,
-            epoch=epoch_i,  # ✅ 添加这行
-            max_epochs=max_epochs  # ✅ 添加这行
-        )
-        
-        # ✅ 修改：传入 epoch_i 和 max_epochs
-        valid_loss = eval_epoch(
-            model, 
-            validation_dataloader,
-            epoch=epoch_i,  # ✅ 添加这行
-            max_epochs=max_epochs  # ✅ 添加这行
-        )
 
-        if epoch_i != max_epochs - 1:
+        if epoch_i != args.n_epochs - 1:
             # 训练阶段输出
-            train_message = f"TRAIN: epoch:{epoch_i + 1}, train_loss:{train_loss:.6f}, valid_loss:{valid_loss:.6f}"
+            train_message = f"TRAIN: epoch:{epoch_i + 1}, train_loss:{train_loss}, valid_loss:{valid_loss}"
             print(train_message)
-            log_results(result_file, train_message)
+            log_results(result_file, train_message)  # 追加到文件
         else:
-            # 最后一个epoch：测试阶段输出
-            # ✅ 修改：传入 epoch_i 和 max_epochs
+            # 测试阶段输出
             test_acc, test_mae, test_corr, test_f_score = test_score_model(
-                model, 
-                test_data_loader,
-                epoch=epoch_i,  # ✅ 添加这行
-                max_epochs=max_epochs  # ✅ 添加这行
+                model, test_data_loader
             )
             test_message = (
-                f"TEST: train_loss:{train_loss:.6f}, valid_loss:{valid_loss:.6f}, "
-                f"test_acc:{test_acc:.6f}, mae:{test_mae:.6f}, corr:{test_corr:.6f}, f1_score:{test_f_score:.6f}"
+                f"TEST: train_loss:{train_loss}, valid_loss:{valid_loss}, "
+                f"test_acc:{test_acc}, mae:{test_mae}, corr:{test_corr}, f1_score:{test_f_score}"
             )
             print(test_message)
-            log_results(result_file, test_message)
+            log_results(result_file, test_message)  # 追加到文件
 
     return train_loss, valid_loss, test_acc, test_mae, test_corr, test_f_score
+
+
+
 
 
 def main():
@@ -560,7 +573,6 @@ def main():
     print(f"Dataset: {args.dataset}")
     print(f"Model: {args.model}")
     print(f"Seed: {args.seed}")
-    print(f"Number of epochs: {args.n_epochs}")
 
     set_random_seed(args.seed)
     (
