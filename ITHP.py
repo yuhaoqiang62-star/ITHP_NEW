@@ -5,92 +5,6 @@ import global_configs
 import math
 
 
-
-class DynamicModalityWeighting(nn.Module):
-    """改进的动态模态权重模块"""
-    def __init__(self, text_dim, acoustic_dim, visual_dim, use_residual=True, temperature=1.0):
-        super().__init__()
-        self.use_residual = use_residual
-        self.temperature = nn.Parameter(torch.tensor(temperature))
-        
-        # 使用更深的网络和更小的瓶颈
-        hidden_dim = 128  # 增加容量
-        
-        self.text_gate = nn.Sequential(
-            nn.Linear(text_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim // 2, 1),
-        )
-        self.acoustic_gate = nn.Sequential(
-            nn.Linear(acoustic_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim // 2, 1),
-        )
-        self.visual_gate = nn.Sequential(
-            nn.Linear(visual_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim // 2, 1),
-        )
-        
-        # 添加全局上下文模块
-        self.global_context = nn.Sequential(
-            nn.Linear(text_dim + acoustic_dim + visual_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 3),
-        )
-        
-    def forward(self, text, acoustic, visual):
-        # 计算每个模态的重要性分数
-        text_score = self.text_gate(text.mean(dim=1))
-        acoustic_score = self.acoustic_gate(acoustic.mean(dim=1))
-        visual_score = self.visual_gate(visual.mean(dim=1))
-        
-        # 全局上下文调整
-        global_features = torch.cat([
-            text.mean(dim=1), 
-            acoustic.mean(dim=1), 
-            visual.mean(dim=1)
-        ], dim=-1)
-        global_adjustment = self.global_context(global_features)
-        
-        # 结合局部和全局信息
-        text_score = text_score + global_adjustment[:, 0:1]
-        acoustic_score = acoustic_score + global_adjustment[:, 1:2]
-        visual_score = visual_score + global_adjustment[:, 2:3]
-        
-        # 使用温度缩放的softmax
-        scores = torch.cat([text_score, acoustic_score, visual_score], dim=1)
-        weights = F.softmax(scores / self.temperature, dim=1)
-        
-        # ✅ 关键改进：添加残差连接，确保不会完全抑制任何模态
-        if self.use_residual:
-            # 基线权重（均等）
-            baseline_weight = 1.0 / 3.0
-            # 混合学习的权重和基线权重
-            alpha = 0.7  # 可调整，0.7表示70%学习权重 + 30%基线
-            weights = alpha * weights + (1 - alpha) * baseline_weight
-        
-        return weights[:, 0:1], weights[:, 1:2], weights[:, 2:3]
-
-
-
-
-
 class CrossModalAttention(nn.Module):
     """跨模态注意力机制"""
 
@@ -180,7 +94,7 @@ class LearnableWeights(nn.Module):
         return torch.exp(self.log_lambda / self.temperature)
 
     def get_weights(self):
-        """返回当前权重值，用于监控"""
+        """返回当前权重值,用于监控"""
         return {
             'beta': self.beta.item(),
             'gamma': self.gamma.item(),
@@ -209,7 +123,7 @@ class GatedBottleneck(nn.Module):
             nn.Linear(input_dim, bottleneck_dim * 2),  # 输出mu和logvar
         )
 
-        # 重要性门控（用于特征选择）
+        # 重要性门控(用于特征选择)
         self.importance_gate = nn.Sequential(
             nn.Linear(input_dim, input_dim),
             nn.Sigmoid()
@@ -234,11 +148,37 @@ class GatedBottleneck(nn.Module):
         # 应用门控到均值
         gated_mu = mu * gate_values
 
-        # 门控也影响方差，但程度较小
+        # 门控也影响方差,但程度较小
         gate_logvar_effect = torch.log(gate_values + 1e-8) * 0.1
         gated_logvar = logvar + gate_logvar_effect
 
         return gated_mu, gated_logvar, gate_values, importance_weights
+
+
+class StandardBottleneck(nn.Module):
+    """标准瓶颈机制(无门控) - 用于消融实验"""
+
+    def __init__(self, input_dim, bottleneck_dim):
+        super(StandardBottleneck, self).__init__()
+
+        # 编码器网络
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, bottleneck_dim * 2),  # 输出mu和logvar
+        )
+
+        # 层归一化
+        self.layer_norm = nn.LayerNorm(input_dim)
+
+    def forward(self, x):
+        # 层归一化
+        normalized_input = self.layer_norm(x)
+
+        # 编码
+        h = self.encoder(normalized_input)
+        mu, logvar = h.chunk(2, dim=-1)
+
+        # 返回格式与GatedBottleneck保持一致，但gate_values和importance_weights为None
+        return mu, logvar, None, None
 
 
 class ITHP(nn.Module):
@@ -260,14 +200,9 @@ class ITHP(nn.Module):
         self.B0_dim = ITHP_args['B0_dim']
         self.B1_dim = ITHP_args['B1_dim']
 
-
-        # ✅ 添加动态模态权重模块
-        self.modality_weighting = DynamicModalityWeighting(
-            text_dim=self.X0_dim,
-            acoustic_dim=self.X1_dim,
-            visual_dim=self.X2_dim
-        )
-
+        # 🔥 门控模式配置 - 消融实验
+        self.gating_mode = ITHP_args.get('gating_mode', 'dual_gating')
+        # 可选值: 'no_gating', 'single_gating', 'dual_gating'
 
         # 可学习权重
         self.learnable_weights = LearnableWeights(
@@ -276,12 +211,15 @@ class ITHP(nn.Module):
             initial_lambda=ITHP_args.get('p_lambda', 0.3)
         )
 
-        # 第一层门控瓶颈编码器
-        self.gated_encoder1 = GatedBottleneck(
-            self.X0_dim, self.B0_dim, gate_activation='sigmoid'
-        )
+        # ================== 第一层编码器 ==================
+        if self.gating_mode == 'no_gating':
+            # 使用标准瓶颈(无门控)
+            self.gated_encoder1 = StandardBottleneck(self.X0_dim, self.B0_dim)
+        else:
+            # 使用门控瓶颈 (single_gating 和 dual_gating)
+            self.gated_encoder1 = GatedBottleneck(self.X0_dim, self.B0_dim, gate_activation='sigmoid')
 
-        # 跨模态注意力（文本-声学）
+        # 跨模态注意力(文本-声学)
         self.text_acoustic_attention = CrossModalAttention(
             query_dim=self.B0_dim,
             key_dim=self.X1_dim,
@@ -290,7 +228,7 @@ class ITHP(nn.Module):
             num_heads=8
         )
 
-        # 第一层MLP（重构声学特征）
+        # 第一层MLP(重构声学特征)
         self.MLP1 = nn.Sequential(
             nn.Linear(self.B0_dim, self.inter_dim),
             nn.ReLU(),
@@ -300,12 +238,15 @@ class ITHP(nn.Module):
             nn.Dropout(self.drop_prob),
         )
 
-        # 第二层门控瓶颈编码器
-        self.gated_encoder2 = GatedBottleneck(
-            self.B0_dim, self.B1_dim, gate_activation='sigmoid'
-        )
+        # ================== 第二层编码器 ==================
+        if self.gating_mode == 'no_gating' or self.gating_mode == 'single_gating':
+            # 使用标准瓶颈(无门控)
+            self.gated_encoder2 = StandardBottleneck(self.B0_dim, self.B1_dim)
+        else:
+            # 使用门控瓶颈 (dual_gating)
+            self.gated_encoder2 = GatedBottleneck(self.B0_dim, self.B1_dim, gate_activation='sigmoid')
 
-        # 跨模态注意力（B0-视觉）
+        # 跨模态注意力(B0-视觉)
         self.b0_visual_attention = CrossModalAttention(
             query_dim=self.B1_dim,
             key_dim=self.X2_dim,
@@ -314,7 +255,7 @@ class ITHP(nn.Module):
             num_heads=8
         )
 
-        # 第二层MLP（重构视觉特征）
+        # 第二层MLP(重构视觉特征)
         self.MLP2 = nn.Sequential(
             nn.Linear(self.B1_dim, self.inter_dim),
             nn.ReLU(),
@@ -334,48 +275,29 @@ class ITHP(nn.Module):
 
         self.criterion = nn.MSELoss()
 
-        # 用于存储注意力权重（便于可视化）
+        # 用于存储注意力权重(便于可视化)
         self.attention_weights = {}
 
-        self.modality_weights_history = []
+    def reparameterise(self, mu, logvar):
+        if self.training:
+            std = logvar.mul(0.5).exp_()
+            eps = std.data.new(std.size()).normal_()
+            return eps.mul(std).add_(mu)
+        else:
+            return mu
 
     def kl_loss(self, mu, logvar):
-        """计算KL散度损失"""
-        kl_div = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
-        kl_mean = torch.mean(kl_div)
-        return kl_mean
-
-    def reparameterise(self, mu, logvar):
-        """重参数化技巧"""
-        epsilon = torch.randn_like(mu)
-        return mu + epsilon * torch.exp(logvar / 2)
+        KLD_element = mu.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar)
+        KLD = torch.sum(KLD_element, dim=-1).mul_(-0.5)
+        KLD = torch.mean(KLD, dim=-1)
+        return torch.mean(KLD, dim=0)
 
     def adaptive_weight_decay(self, epoch, max_epochs):
         """自适应权重衰减"""
-        progress = epoch / max_epochs
-        decay_factor = 1.0 - 0.5 * progress  # 随训练进程减少权重影响
-        return decay_factor
+        decay = 1.0 - (epoch / max_epochs) * 0.3
+        return max(decay, 0.7)
 
-    def forward(self, x, visual, acoustic, epoch=0, max_epochs=100):
-        # ✅ 1. 首先计算动态模态权重
-        w_text, w_acoustic, w_visual = self.modality_weighting(x, acoustic, visual)
-        
-        # 保存权重用于分析
-        self.modality_weights_history.append({
-            'text': w_text.mean().item(),
-            'acoustic': w_acoustic.mean().item(),
-            'visual': w_visual.mean().item()
-        })
-        
-        # ✅ 2. 应用权重到原始模态
-        weighted_x = x * w_text.unsqueeze(1)
-        weighted_acoustic = acoustic * w_acoustic.unsqueeze(1)
-        weighted_visual = visual * w_visual.unsqueeze(1)
-
-
-
-
-
+    def forward(self, x, acoustic, visual, epoch=0, max_epochs=40):
         # 获取当前可学习权重
         current_weights = self.learnable_weights.get_weights()
         beta = self.learnable_weights.beta
@@ -393,7 +315,7 @@ class ITHP(nn.Module):
         # 重参数化
         b0 = self.reparameterise(mu1, logvar1)
 
-        # 跨模态注意力（B0特征关注声学特征）
+        # 跨模态注意力(B0特征关注声学特征)
         attended_b0, attention_weights_1 = self.text_acoustic_attention(
             query=b0, key=acoustic, value=acoustic
         )
@@ -417,7 +339,7 @@ class ITHP(nn.Module):
         # 重参数化
         b1 = self.reparameterise(mu2, logvar2)
 
-        # 跨模态注意力（B1特征关注视觉特征）
+        # 跨模态注意力(B1特征关注视觉特征)
         attended_b1, attention_weights_2 = self.b0_visual_attention(
             query=b1, key=visual, value=visual
         )
@@ -441,7 +363,16 @@ class ITHP(nn.Module):
         # 总的信息瓶颈损失
         IB_total = IB0 + lambda_weight * IB1
 
-        # 返回结果和中间变量（用于分析）
+        # 🔥 返回重构结果(用于消融实验)
+        reconstructions = {
+            'b0': enhanced_b0,  # 第一层瓶颈特征
+            'b1': enhanced_b1,  # 第二层瓶颈特征(纯B1)
+            'acoustic_recon': output1,  # 声学重构
+            'visual_recon': output2,  # 视觉重构
+            'final_b1': final_b1  # 融合后的B1
+        }
+
+        # 返回结果和中间变量(用于分析)
         intermediate_results = {
             'gate1_values': gate1_values,
             'gate2_values': gate2_values,
@@ -449,10 +380,8 @@ class ITHP(nn.Module):
             'importance2_weights': importance2_weights,
             'attention_weights': self.attention_weights.copy(),
             'current_weights': current_weights,
-            'enhanced_b0': enhanced_b0,
-            'enhanced_b1': enhanced_b1,
-            'reconstructed_acoustic': output1,
-            'reconstructed_visual': output2
+            'reconstructions': reconstructions,
+            'gating_mode': self.gating_mode  # 🔥 添加门控模式信息
         }
 
         return final_b1, IB_total, kl_loss_0, mse_0, kl_loss_1, mse_1, intermediate_results
@@ -461,7 +390,7 @@ class ITHP(nn.Module):
 # ================== 使用示例和训练相关代码 ==================
 
 class ImprovedTrainingLoop:
-    """改进的训练循环，包含监控和可视化功能"""
+    """改进的训练循环,包含监控和可视化功能"""
 
     def __init__(self, model, optimizer, scheduler, device):
         self.model = model
@@ -514,7 +443,7 @@ class ImprovedTrainingLoop:
             self.optimizer.zero_grad()
             total_loss.backward()
 
-            # 梯度裁剪（防止梯度爆炸）
+            # 梯度裁剪(防止梯度爆炸)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
             self.optimizer.step()
@@ -531,7 +460,7 @@ class ImprovedTrainingLoop:
             current_weights = intermediate['current_weights']
             epoch_stats['weight_changes'] = current_weights
 
-            # 计算注意力熵（衡量注意力分布集中程度）
+            # 计算注意力熵(衡量注意力分布集中程度)
             for key, attention_weights in intermediate['attention_weights'].items():
                 entropy = self.calculate_attention_entropy(attention_weights)
                 epoch_stats['attention_entropy'].append(entropy.item())
